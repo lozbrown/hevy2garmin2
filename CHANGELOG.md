@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-07-09
+
+### Added
+- **Enforced cooldown after a Garmin login rate-limit** ([#211](https://github.com/drkostas/hevy2garmin/issues/211)). When Garmin rate-limits a login, retrying resets Garmin's own timer and makes it worse. The tool now records an exponential-backoff cooldown (2h, then 4h, 8h, capped at 24h, reset after a clean login) and, while it is active, the local setup skips the Garmin login attempt entirely so you cannot deepen the block by retrying. Cloud rate-limits are recorded too, and the setup page and dashboard show a live countdown with the Connect button disabled until it clears. Sync resumes automatically once the window passes.
+
+## [0.5.13] - 2026-07-09
+
+### Added
+- **Grace period before syncing** ([#205](https://github.com/drkostas/hevy2garmin/issues/205)). Automatic syncs (self-hosted auto-sync and the CLI) now wait `sync.grace_period_minutes` (default 120) after a workout ends before syncing it, so the Garmin watch activity has time to appear and the workout merges into one activity instead of creating a duplicate. Manual "Sync now" ignores the grace period.
+- **Duplicate detection (log-only)** ([#205](https://github.com/drkostas/hevy2garmin/issues/205)). Each sync scans recent workouts and reports any that ended up with both a tool-created and a watch activity for the same session, plus a manual "scan for duplicates" action. It only reports, it does not delete anything.
+
+### Fixed
+- **Fresh uploads that land without heart rate are now retried once and reported** ([#205](https://github.com/drkostas/hevy2garmin/issues/205)). The heart-rate fetch retries once if the first attempt is empty, and an upload that still ends up without HR is counted and logged instead of silently having none.
+
+### Note
+- Merge reliability currently applies to the self-hosted and CLI sync path. Bringing it to the Vercel cron path is tracked in [#206](https://github.com/drkostas/hevy2garmin/issues/206).
+
+## [0.5.12] - 2026-07-07
+
+### Fixed
+- **Merge dropped every exercise set when Garmin rejected one exercise** ([#199](https://github.com/drkostas/hevy2garmin/issues/199)). The exerciseSets push is atomic, so a single exercise whose (category, subcategory) pair Garmin rejects (a 400 "Invalid Sub-Category") made the whole activity lose its sets, and after three such workouts merge was disabled for the rest of the run. It now retries once with the exercise names stripped (the category is kept, which Garmin always accepts), so the sets, reps and weights still land. Thanks @silas_christopher for the detailed report.
+- **Some exercises showed as "Total Body" instead of their real category** ([#201](https://github.com/drkostas/hevy2garmin/issues/201)). Cardio machines (cycling, treadmill, elliptical, rowing machine and others) and a few rows were mapped to FIT categories the bundled library does not implement, so they fell back to the generic Total Body. They now use valid categories: cardio machines show as Cardio, and the chest-supported dumbbell row shows its real name.
+- **Misleading Garmin rate-limit message** ([#202](https://github.com/drkostas/hevy2garmin/issues/202)). The setup screen said to "wait a few minutes" on a Garmin rate limit, but it is usually a few hours and retrying resets the timer. The message now says so, and makes clear it is on Garmin's side and separate from your password.
+
 ## [0.5.11] - 2026-06-26
 
 ### Added

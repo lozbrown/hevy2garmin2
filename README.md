@@ -83,17 +83,17 @@ This token lets hevy2garmin set up automatic syncing on your behalf. Open [this 
 
 1. Go to [vercel.com/new](https://vercel.com/new) and sign in with GitHub
 2. Find **hevy2garmin** in your repo list and click **Import**
-3. If you see an **Integrations** section, click **Add** next to **Neon** (this is the free database that stores your sync history). If you don't see it, no problem -- after deploy, go to your project's **Storage** tab and add **Neon Postgres** from there.
-4. **Environment Variables** -- fill in these 4 values:
+3. **Add a database (required).** If you see an **Integrations** or **Storage** section during import, add **Neon Postgres** (it's free). This is where your sync history lives. If you don't see it during import, that's fine: deploy first, then open your project's **Storage** tab, add **Neon Postgres**, and redeploy. A serverless host has a read-only filesystem, so with no database the app can't save anything and shows an "internal server error".
+4. **Environment Variables.** Vercel does not pre-fill these. The form shows an empty field with a placeholder like `EXAMPLE_NAME`. Add each of the four below as its own variable: type the name in **Key**, the value in **Value**, then click **Add More** for the next one.
 
-| Field | What to paste |
+| Key | What to paste |
 |-------|--------------|
 | `HEVY_API_KEY` | The API key from step 1 |
 | `GARMIN_EMAIL` | Your Garmin Connect email |
 | `GARMIN_PASSWORD` | Your Garmin Connect password |
 | `GITHUB_PAT` | The token from step 3 |
 
-5. Click **Deploy** and wait about a minute for it to build.
+5. Click **Deploy** and wait about a minute for it to build. If the deployed page shows an "internal server error", it almost always means the database step was skipped: add **Neon Postgres** from the **Storage** tab, then redeploy.
 
 **Step 6: Connect Garmin**
 
@@ -117,6 +117,13 @@ You're on the dashboard. Click **Sync All Workouts** to backfill your history. T
 > **EU users:** If you see an upload consent error, go to [Garmin Connect Settings](https://connect.garmin.com/modern/settings) > scroll to **Data** > enable **Device Upload**. This is a one-time Garmin GDPR requirement.
 
 To keep future workouts syncing automatically, toggle **Auto-sync** on the dashboard. This creates a background job that syncs new workouts every 2 hours.
+
+> **Sync timing:** hevy2garmin waits `sync.grace_period_minutes` (default 120)
+> after a workout ends before syncing it automatically, so your Garmin watch
+> activity can land first and it merges into one activity instead of creating a
+> duplicate. On Vercel the default cron runs once a day; if your plan allows,
+> lower the cron interval (e.g. every few hours) so recently-finished workouts
+> sync the same day. Manual "Sync now" always ignores the grace period.
 
 **That's it.** Check [Garmin Connect](https://connect.garmin.com/modern/activities) to see your workouts with proper exercise names, sets, reps, and weights.
 

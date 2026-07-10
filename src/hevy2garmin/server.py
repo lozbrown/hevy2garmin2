@@ -17,9 +17,11 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 
 from hevy2garmin import db, __version__
+from hevy2garmin.db_interface import NoWritableDatabaseError
 from hevy2garmin.auth import auth_enabled, verify_session, sign_session, check_password, SESSION_COOKIE
 from hevy2garmin.config import is_configured, load_config, save_config
 from hevy2garmin.demo import is_demo_mode
+from hevy2garmin.ratelimit import record_rate_limit, cooldown_remaining, clear_rate_limit, format_cooldown
 from hevy2garmin.sync import sync
 
 logger = logging.getLogger("hevy2garmin")
@@ -55,6 +57,37 @@ def _render(template_name: str, **ctx) -> HTMLResponse:
 
 app = FastAPI(title="hevy2garmin", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+_NO_DB_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hevy2garmin — database needed</title>
+<style>
+ body{margin:0;background:#0f1115;color:#e6e6e6;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ .card{max-width:560px;margin:24px;padding:32px;background:#171a21;border:1px solid #262b36;border-radius:14px}
+ h1{margin:0 0 4px;font-size:20px}
+ p{color:#aab2c0}
+ ol{padding-left:20px} li{margin:8px 0}
+ code{background:#0f1115;border:1px solid #262b36;border-radius:6px;padding:1px 6px;font-size:14px}
+ a{color:#7aa2ff}
+</style></head><body><div class="card">
+ <h1>Almost there — hevy2garmin needs a database</h1>
+ <p>This deployment has no database attached yet. Serverless hosts have a read-only
+ filesystem, so the app can't fall back to a local file and needs Postgres.</p>
+ <ol>
+  <li>Open your project on <a href="https://vercel.com/dashboard" target="_blank" rel="noopener">Vercel</a>.</li>
+  <li>Go to the <b>Storage</b> tab and add a <b>Neon Postgres</b> database (it's free). This sets <code>POSTGRES_URL</code> automatically.</li>
+  <li>Go to <b>Deployments</b>, open the latest one, and click <b>Redeploy</b>.</li>
+ </ol>
+ <p>Once the database is connected and it redeploys, this page becomes your dashboard.</p>
+</div></body></html>"""
+
+
+@app.exception_handler(NoWritableDatabaseError)
+async def _no_database_handler(request: Request, exc: NoWritableDatabaseError) -> HTMLResponse:
+    """Render an actionable 'add a database' page instead of a raw 500 (#145, #142)."""
+    logger.warning("No writable database on %s: %s", request.url.path, exc)
+    return HTMLResponse(_NO_DB_PAGE, status_code=503)
 
 
 # ── Auto-sync state ─────────────────────────────────────────────────────────
@@ -157,7 +190,7 @@ def _run_autosync() -> None:
     logger.info("Auto-sync: running scheduled sync")
     hevy_auth_failed = False
     try:
-        result = sync(limit=10, dry_run=False)
+        result = sync(limit=10, dry_run=False, respect_grace=True)
     except Exception as e:
         from hevy2garmin.hevy import HevyAuthError
         if isinstance(e, HevyAuthError):
@@ -429,6 +462,15 @@ async def dashboard(request: Request):
         mapping_count = len(HEVY_TO_GARMIN) + len(_custom_mappings)
     except Exception:
         pass
+    garmin_cooldown = 0
+    garmin_cooldown_str = ""
+    try:
+        garmin_cooldown = cooldown_remaining(db.get_db())
+        if garmin_cooldown > 0:
+            garmin_cooldown_str = format_cooldown(garmin_cooldown)
+    except Exception:
+        pass
+
     return _render(
         "dashboard.html",
         synced_count=synced_count,
@@ -440,13 +482,24 @@ async def dashboard(request: Request):
         mapping_count=mapping_count,
         garmin_connected=garmin_connected,
         needs_actions_setup=False,
+        garmin_cooldown=garmin_cooldown,
+        garmin_cooldown_str=garmin_cooldown_str,
     )
 
 
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
-    return _render("setup.html", config=load_config(), is_cloud=bool(db.get_database_url()))
+    garmin_cooldown = 0
+    garmin_cooldown_str = ""
+    try:
+        garmin_cooldown = cooldown_remaining(db.get_db())
+        if garmin_cooldown > 0:
+            garmin_cooldown_str = format_cooldown(garmin_cooldown)
+    except Exception:
+        pass
+    return _render("setup.html", config=load_config(), is_cloud=bool(db.get_database_url()),
+                   garmin_cooldown=garmin_cooldown, garmin_cooldown_str=garmin_cooldown_str)
 
 
 @app.post("/setup")
@@ -511,41 +564,76 @@ async def setup_save(
 
     garmin_error = None
     if garmin_pw and garmin_em and not db.get_database_url():
+        # Gate: enforce local cooldown before attempting any Garmin login.
+        # Retrying resets Garmin's own rate-limit timer, so we must skip the
+        # attempt entirely when cooling down — not just warn about it.
+        _cooldown = 0
         try:
-            from hevy2garmin.garmin import get_client
-            get_client(garmin_em, garmin_pw)
-        except Exception as e:
-            logger.warning("Garmin login test failed: %s", e)
-            err = str(e)
-            if "MFA" in err.upper():
-                garmin_error = (
-                    "Garmin MFA (two-factor authentication) is enabled. "
-                    "Temporarily disable MFA in your Garmin account settings, "
-                    "connect here, then re-enable it."
-                )
-            elif "429" in err or "rate limit" in err.lower():
-                garmin_error = (
-                    "Garmin has temporarily rate-limited login attempts for your "
-                    "account (this is separate from your password — your Garmin "
-                    "website/app login still works). It clears on its own, usually "
-                    "within a few hours. Don't retry repeatedly, as that resets the "
-                    "timer. Click 'Skip for now'; your credentials are saved and "
-                    "sync will resume automatically."
-                )
-            elif "SSO login failed" in err:
-                garmin_error = (
-                    "Garmin login failed. Double-check your email and password. "
-                    "If they're correct, Garmin may be temporarily blocking logins "
-                    "from this server. Try again in an hour."
-                )
-            else:
-                # Strip any HTML tags from Garmin error responses
-                cleaned = re.sub(r"<[^>]+>", " ", err)
-                cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()[:200]
-                garmin_error = cleaned or "Unknown error. Check your email and password."
+            _cooldown = cooldown_remaining(db.get_db())
+        except Exception:
+            pass
+        if _cooldown > 0:
+            garmin_error = (
+                "Garmin is still cooling down, "
+                + format_cooldown(_cooldown)
+                + " left. Leave it be. Retrying resets the timer. "
+                "Click 'Skip for now'; your credentials are saved and "
+                "sync will resume automatically once it clears."
+            )
+        else:
+            try:
+                from hevy2garmin.garmin import get_client
+                get_client(garmin_em, garmin_pw)
+                # Login succeeded — reset the backoff counter.
+                try:
+                    clear_rate_limit(db.get_db())
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("Garmin login test failed: %s", e)
+                err = str(e)
+                if "MFA" in err.upper():
+                    garmin_error = (
+                        "Garmin MFA (two-factor authentication) is enabled. "
+                        "Temporarily disable MFA in your Garmin account settings, "
+                        "connect here, then re-enable it."
+                    )
+                elif "429" in err or "rate limit" in err.lower():
+                    _cd_secs = 2 * 3600
+                    try:
+                        _cd_secs = record_rate_limit(db.get_db())
+                    except Exception:
+                        pass
+                    garmin_error = (
+                        "Garmin has rate-limited login attempts for your account "
+                        "(enforcing a " + format_cooldown(_cd_secs) + " cooldown locally "
+                        "to protect your account). It clears on its own. Retrying "
+                        "resets the timer. Click 'Skip for now'; your credentials are "
+                        "saved and sync will resume automatically."
+                    )
+                elif "SSO login failed" in err:
+                    garmin_error = (
+                        "Garmin login failed. Double-check your email and password. "
+                        "If they're correct, Garmin may be temporarily blocking logins "
+                        "from this server. Try again in an hour."
+                    )
+                else:
+                    # Strip any HTML tags from Garmin error responses
+                    cleaned = re.sub(r"<[^>]+>", " ", err)
+                    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()[:200]
+                    garmin_error = cleaned or "Unknown error. Check your email and password."
     if garmin_error:
+        _cd2 = 0
+        _cd2_str = ""
+        try:
+            _cd2 = cooldown_remaining(db.get_db())
+            if _cd2 > 0:
+                _cd2_str = format_cooldown(_cd2)
+        except Exception:
+            pass
         return _render("setup.html", config=load_config(), garmin_error=garmin_error,
-                        allow_skip=True, is_cloud=bool(db.get_database_url()))
+                        allow_skip=True, is_cloud=bool(db.get_database_url()),
+                        garmin_cooldown=_cd2, garmin_cooldown_str=_cd2_str)
 
     response = RedirectResponse("/", status_code=303)
     # Set auth cookie if HEVY2GARMIN_SECRET is configured (cloud deployments)
@@ -605,6 +693,19 @@ async def garmin_ticket_store(request: Request):
             _json.dumps({"error": str(e)[:200]}),
             status_code=500,
         )
+
+
+@app.post("/api/garmin-rate-limited")
+async def api_garmin_rate_limited(request: Request):
+    """Browser reports a Garmin rate_limited response from the worker so we can
+    record the cooldown for display. Returns the cooldown length in seconds."""
+    import json as _json
+    try:
+        seconds = record_rate_limit(db.get_db())
+        return HTMLResponse(_json.dumps({"cooldown_seconds": seconds}))
+    except Exception as e:
+        logger.warning("Could not record rate-limit: %s", e)
+        return HTMLResponse(_json.dumps({"cooldown_seconds": 0}))
 
 
 @app.get("/workouts", response_class=HTMLResponse)
@@ -1170,7 +1271,7 @@ async def api_sync(request: Request):
         return HTMLResponse('<div class="toast toast-error">Another sync is already running. Please wait.</div>')
 
     try:
-        result = sync(**sync_kwargs)
+        result = sync(**sync_kwargs, respect_grace=False)
     except Exception as e:
         result = {"synced": 0, "skipped": 0, "failed": 1, "unmapped": [], "error": str(e)}
     finally:
@@ -1284,6 +1385,26 @@ async def api_unsync_all(request: Request):
 
     logger.info("Unsynced all %d workouts", count)
     return JSONResponse({"ok": True, "count": count})
+
+
+@app.post("/api/scan-duplicates", response_class=HTMLResponse)
+async def api_scan_duplicates(request: Request):
+    """On-demand: scan recent workouts for duplicate tool+watch activity pairs
+    and show the count. Log-only, no deletion."""
+    from hevy2garmin.reconcile import detect_duplicates
+    from hevy2garmin.sync import fetch_workouts, _hr_limiter
+    from hevy2garmin.hevy import HevyClient
+    from hevy2garmin.garmin import get_client
+    try:
+        cfg = load_config()
+        hevy = HevyClient(api_key=cfg.get("hevy_api_key"))
+        garmin_client = get_client(cfg.get("garmin_email"))
+        workouts = fetch_workouts(hevy, limit=50)
+        dups = detect_duplicates(garmin_client, workouts, _hr_limiter)
+    except Exception as e:
+        logger.warning("Duplicate scan failed: %s", e)
+        return HTMLResponse(f'<div class="toast toast-error">Scan failed: {e}</div>')
+    return HTMLResponse(f"<div>Found {len(dups)} possible duplicate(s). See server logs for details.</div>")
 
 
 @app.post("/api/toggle-autosync", response_class=HTMLResponse)
